@@ -1,0 +1,11 @@
+flask
+requests
+beautifulsoup4
+feedparser
+google-cloud-aiplatform
+python-dotenv
+waitress
+APScheduler
+numpy
+faiss-cpu
+tldextract

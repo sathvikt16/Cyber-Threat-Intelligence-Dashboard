@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CTI Dashboard v3.1</title>
+    <!-- Add Leaflet CSS back -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    <header>
+        <h1> Threat Intelligence Dashboard</h1>
+    </header>
+    <div class="dashboard-container">
+        <main id="main-content" class="main-content-area">
+            <!-- New Map Container -->
+            <div id="threat-map-container">
+                <div id="threat-map"></div>
+            </div>
+
+            <!-- Pulse details will be loaded below the map -->
+            <div id="pulse-detail-container">
+                <div class="placeholder">
+                    <h2>Welcome to the CTI Dashboard</h2>
+                    <p>Select an intelligence pulse from the sidebar to view its details here. The map above shows the geographic distribution of recent threats.</p>
+                </div>
+            </div>
+        </main>
+        <aside id="pulse-sidebar" class="sidebar">
+            <h2>Intelligence Feed</h2>
+            <div id="pulse-list">
+                <p class="loading">Loading pulses...</p>
+            </div>
+        </aside>
+    </div>
+    <!-- Add Leaflet JS back -->
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>
+</body>
+</html>

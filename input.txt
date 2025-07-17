@@ -1,0 +1,614 @@
+1 > orchestrator.py : 
+
+
+
+import schedule
+import time
+from agents import DataIngestionAgent, IntelligenceExtractionAgent, IoCAnalysisAgent, PersistenceAgent
+from database.db_handler import init_db
+
+def main_workflow():
+    """The main orchestration function that coordinates all agents."""
+    print("\n" + "="*50 + f"\nORCHESTRATOR: Starting new workflow run at {time.ctime()}\n" + "="*50)
+
+    ingestion_agent = DataIngestionAgent()
+    extraction_agent = IntelligenceExtractionAgent()
+    analysis_agent = IoCAnalysisAgent()
+    persistence_agent = PersistenceAgent()
+
+    # 1. Ingest Data from all sources
+    raw_cisa = ingestion_agent.ingest_cisa()
+    raw_thn = ingestion_agent.ingest_hacker_news()
+    raw_nist = ingestion_agent.ingest_nist_nvd(days=2) # Add the new agent to the workflow
+    all_raw_data = raw_cisa + raw_thn + raw_nist
+    
+    print(f"\nORCHESTRATOR: Ingested {len(all_raw_data)} total items.")
+
+    # 2. Process each item through the pipeline
+    for raw_item in all_raw_data:
+        if not raw_item.get('content'):
+            print(f"ORCHESTRATOR: Skipping item '{raw_item.get('title')}' due to empty content.")
+            continue
+        pulse = extraction_agent.process_raw_data(raw_item)
+        if not pulse:
+            print(f"ORCHESTRATOR: Skipping item '{raw_item['title']}' due to extraction failure.")
+            continue
+        if pulse.get('indicators'):
+            pulse['indicators'] = analysis_agent.enrich_indicators(pulse['indicators'])
+        persistence_agent.save_pulse(pulse)
+        print("-" * 20)
+
+    print("\nORCHESTRATOR: Workflow run finished.")
+
+def main():
+    print("Initializing CTI Orchestrator...")
+    init_db()
+    main_workflow()
+    schedule.every(2).hours.do(main_workflow)
+    print("\nOrchestrator started. Waiting for next scheduled run...")
+    while True:
+        schedule.run_pending()
+        time.sleep(60)
+
+if __name__ == "__main__":
+    main()
+
+
+2 > agents.py : 
+
+
+import requests
+import feedparser
+from bs4 import BeautifulSoup
+import time
+from datetime import datetime, timedelta
+import os
+from dotenv import load_dotenv
+import warnings
+
+from processor.vertex_ai_processor import extract_intelligence_with_gemini
+from database.db_handler import insert_pulse_and_indicators
+
+load_dotenv()
+
+VERIFY_SSL = False 
+if not VERIFY_SSL:
+    from urllib3.exceptions import InsecureRequestWarning
+    warnings.simplefilter('ignore', InsecureRequestWarning)
+
+# --- Agent 1: Data Ingestion ---
+class DataIngestionAgent:
+    def ingest_cisa(self):
+        """Fetches raw data from the stable CISA JSON feed."""
+        print("AGENT (Ingestion): Fetching CISA data...")
+        # === FIX: Using the more stable direct JSON feed from CISA's official source ===
+        cisa_url = "https://www.cisa.gov/api/v1/cybersecurity-advisories/all.json"
+        raw_data = []
+        try:
+            response = requests.get(cisa_url, verify=VERIFY_SSL, timeout=30)
+            response.raise_for_status()
+            advisories = response.json()
+
+            for entry in advisories[:5]: # Limit to 5 most recent for demo
+                raw_data.append({
+                    "source": "CISA", "title": entry.get('title'), "url": entry.get('url'),
+                    "content": f"Title: {entry.get('title')}\n\nSummary: {entry.get('summary')}",
+                    "published_at": entry.get('created')
+                })
+        except requests.RequestException as e:
+            print(f"  ERROR fetching CISA feed: {e}")
+        return raw_data
+
+    def ingest_hacker_news(self, limit=3):
+        """Scrapes raw data from The Hacker News with FIXED selectors."""
+        print(f"AGENT (Ingestion): Fetching The Hacker News (limit={limit})...")
+        raw_data = []
+        try:
+            response = requests.get("https://thehackernews.com/", headers={'User-Agent': 'Mozilla/5.0'}, verify=VERIFY_SSL, timeout=20)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.content, 'html.parser')
+            articles = soup.select('a.story-link')
+            
+            for article_link in articles[:limit]:
+                url = article_link.get('href')
+                time.sleep(1)
+                try:
+                    article_response = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, verify=VERIFY_SSL, timeout=20)
+                    article_response.raise_for_status()
+                    article_soup = BeautifulSoup(article_response.content, 'html.parser')
+                    title = article_soup.select_one('h1.story-title').get_text(strip=True)
+                    # === FIX: Use the correct selector for the article body ===
+                    content_div = article_soup.select_one('div.articlebody') 
+                    full_text = content_div.get_text(separator='\n', strip=True) if content_div else ""
+                    
+                    if not full_text:
+                        print(f"  WARN: Could not extract text content from {url}. Skipping.")
+                        continue
+                        
+                    raw_data.append({
+                        "source": "The Hacker News", "title": title, "url": url, "content": full_text,
+                        "published_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    })
+                except Exception as e:
+                    print(f"  ERROR scraping article {url}: {e}")
+        except Exception as e:
+            print(f"ERROR fetching THN main page: {e}")
+        return raw_data
+
+    def ingest_nist_nvd(self, days=2):
+        """Fetches recent CVEs from the NIST NVD API."""
+        print(f"AGENT (Ingestion): Fetching NIST NVD CVEs for the last {days} day(s)...")
+        raw_data = []
+        try:
+            base_url = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+            end_date = datetime.utcnow()
+            start_date = end_date - timedelta(days=days)
+            params = {'pubStartDate': start_date.isoformat(), 'pubEndDate': end_date.isoformat()}
+            
+            response = requests.get(base_url, params=params, timeout=30, verify=VERIFY_SSL)
+            response.raise_for_status()
+            cve_data = response.json()
+            
+            for item in cve_data.get('vulnerabilities', []):
+                cve = item.get('cve', {})
+                cve_id = cve.get('id')
+                description = next((d['value'] for d in cve.get('descriptions', []) if d['lang'] == 'en'), 'No description.')
+                published_date = cve.get('published')
+                
+                raw_data.append({
+                    "source": "NIST NVD", "title": f"Vulnerability Details for {cve_id}", "url": f"https://nvd.nist.gov/vuln/detail/{cve_id}",
+                    "content": f"Vulnerability ID: {cve_id}\n\nDescription: {description}",
+                    "published_at": published_date
+                })
+        except requests.RequestException as e:
+            print(f"  ERROR fetching NIST NVD data: {e}")
+        return raw_data
+
+# The other agents (IntelligenceExtraction, IoCAnalysis, Persistence) remain the same.
+# You can copy them from your existing file. For completeness, they are included below.
+
+class IntelligenceExtractionAgent:
+    def process_raw_data(self, raw_data_item):
+        print(f"AGENT (Extraction): Processing '{raw_data_item['title']}' with Vertex AI...")
+        structured_data = extract_intelligence_with_gemini(raw_data_item['content'], raw_data_item['source'])
+        
+        # === FAIL-SAFE: If AI processing returns None, create a basic pulse object ===
+        if not structured_data:
+            print("  WARN: AI processing failed. Creating a basic pulse.")
+            return {
+                "source": raw_data_item['source'],
+                "title": raw_data_item['title'],
+                "url": raw_data_item['url'],
+                "published_at": raw_data_item['published_at'],
+                "summary": "AI processing failed. Please review the source material directly.",
+                "threat_name": "N/A",
+                "threat_category": "Unprocessed",
+                "targeted_industries": [],
+                "targeted_countries": [],
+                "indicators": []
+            }
+            
+        # Combine original data with AI-extracted data
+        pulse = {
+            "source": raw_data_item['source'],
+            "title": structured_data.get('pulse_title', raw_data_item['title']),
+            "url": raw_data_item['url'],
+            "published_at": raw_data_item['published_at'],
+            **structured_data
+        }
+        return pulse
+class IoCAnalysisAgent:
+    def enrich_indicators(self, indicators):
+        print(f"AGENT (Analysis): Enriching {len(indicators)} indicators...")
+        api_key = os.getenv("ABUSEIPDB_API_KEY")
+        if not api_key: 
+            return indicators
+        
+        enriched_indicators = []
+        for ioc in indicators:
+            # Handle both string and dictionary formats
+            if isinstance(ioc, str):
+                # If it's a string, try to determine the type and convert to dict
+                ioc_dict = {'value': ioc, 'type': self._determine_ioc_type(ioc)}
+            elif isinstance(ioc, dict):
+                # If it's already a dictionary, use it as-is
+                ioc_dict = ioc
+            else:
+                # Skip unknown types
+                print(f"  WARN: Skipping unknown indicator type: {type(ioc)}")
+                continue
+            
+            # Only enrich IPv4 addresses
+            if ioc_dict.get('type') == 'ipv4':
+                try:
+                    response = requests.get(
+                        'https://api.abuseipdb.com/api/v2/check', 
+                        params={'ipAddress': ioc_dict['value'], 'maxAgeInDays': '90'}, 
+                        headers={'Accept': 'application/json', 'Key': api_key}, 
+                        verify=VERIFY_SSL, 
+                        timeout=20
+                    )
+                    if response.status_code == 200:
+                        ioc_dict['enrichment'] = response.json().get('data', {})
+                        abuse_score = ioc_dict['enrichment'].get('abuseConfidenceScore')
+                        if abuse_score is not None: 
+                            print(f"  Enriched IP: {ioc_dict['value']}, Score: {abuse_score}%")
+                except Exception as e: 
+                    print(f"  ERROR enriching IP {ioc_dict['value']}: {e}")
+            
+            enriched_indicators.append(ioc_dict)
+        
+        return enriched_indicators
+    
+    def _determine_ioc_type(self, ioc_value):
+        """Simple heuristic to determine IoC type from string value"""
+        import re
+        
+        # IPv4 pattern
+        ipv4_pattern = r'^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$'
+        if re.match(ipv4_pattern, ioc_value):
+            return 'ipv4'
+        
+        # Domain pattern (basic)
+        domain_pattern = r'^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*$'
+        if re.match(domain_pattern, ioc_value):
+            return 'domain'
+        
+        # URL pattern
+        if ioc_value.startswith(('http://', 'https://')):
+            return 'url'
+        
+        # Hash patterns
+        if len(ioc_value) == 32 and all(c in '0123456789abcdefABCDEF' for c in ioc_value):
+            return 'md5'
+        elif len(ioc_value) == 40 and all(c in '0123456789abcdefABCDEF' for c in ioc_value):
+            return 'sha1'
+        elif len(ioc_value) == 64 and all(c in '0123456789abcdefABCDEF' for c in ioc_value):
+            return 'sha256'
+        
+        # Default to generic indicator
+        return 'indicator'
+class PersistenceAgent:
+    def save_pulse(self, pulse_data):
+        # This agent remains unchanged
+        print(f"AGENT (Persistence): Saving pulse '{pulse_data['title']}' to database...")
+        insert_pulse_and_indicators(pulse_data)
+
+
+3 > vertex_ai_processor.py
+
+
+import vertexai
+from vertexai.generative_models import GenerativeModel
+import json
+import os
+
+# --- Vertex AI Initialization ---
+PROJECT_ID = "itd-ai-interns"
+REGION = "us-central1"
+vertexai.init(project=PROJECT_ID, location=REGION)
+
+def extract_intelligence_with_gemini(text_content: str, source: str, model_name: str = "gemini-2.5-flash") -> dict | None:
+    """
+    Analyzes text using Gemini on Vertex AI to extract structured threat intelligence.
+    Uses a more stable model version and includes threat categorization.
+    """
+    model = GenerativeModel(model_name)
+
+    # A more detailed prompt to mimic OTX-style data extraction
+    prompt = f"""
+    Analyze the following cyber threat intelligence text from '{source}'. Your mission is to act as an expert CTI analyst and extract structured data.
+
+    The text is:
+    ---
+    {text_content[:25000]}
+    ---
+
+    Extract the following information and structure your response as a single JSON object. Do NOT provide any text or explanation outside of the JSON object.
+
+    1.  "pulse_title": The original title of the article or report.
+    2.  "threat_name": The specific name of the malware (e.g., "Qakbot"), vulnerability (e.g., "CVE-2023-1234"), or threat actor group (e.g., "APT28"). If not mentioned, use "N/A".
+    3.  "threat_category": Classify the primary threat into one of these categories: ["Vulnerability", "Malware", "Phishing", "APT Activity", "Data Breach", "Cybercrime", "General Security News"]. Choose the single most appropriate category.
+    4.  "targeted_industries": A JSON list of specific industries targeted (e.g., ["Logistics", "Finance", "Healthcare"]). If none are explicitly mentioned, use an empty list [].
+    5.  "targeted_countries": A JSON list of countries targeted or affected (e.g., ["USA", "Germany", "Brazil"]). Use standard country names. If none are explicitly mentioned, use an empty list [].
+    6.  "summary": A concise, two-sentence summary of the threat for an executive audience.
+    7.  "indicators": A JSON list of observable Indicators of Compromise (IoCs) found in the text.
+        - Supported types are: 'ipv4', 'domain', 'md5', 'sha1', 'sha256', 'url'.
+        - If no indicators are found, use an empty list [].
+
+    Example of a perfect JSON response:
+    {{
+      "pulse_title": "Critical Flaw in FortiWeb (CVE-2025-25257) Allows SQL Injection",
+      "threat_name": "CVE-2025-25257",
+      "threat_category": "Vulnerability",
+      "targeted_industries": ["Logistics", "Finance", "Healthcare"],
+      "targeted_countries": ["Global"],
+      "summary": "Fortinet has released patches for a critical SQL injection vulnerability in its FortiWeb Web Application Firewall. The flaw, tracked as CVE-2025-25257, could allow an unauthenticated attacker to execute arbitrary code.",
+      "indicators": ['sha256']
+    }}
+    """
+
+    try:
+        response = model.generate_content(prompt)
+        cleaned_response = response.text.strip().replace("```json", "").replace("```", "").strip()
+        return json.loads(cleaned_response)
+    except json.JSONDecodeError:
+        print(f"Error: Gemini did not return valid JSON. Raw response:\n{response.text}")
+        return None
+    except Exception as e:
+        print(f"An error occurred with the Vertex AI API: {e}")
+        return None
+
+
+4> db_handler.py
+
+import sqlite3
+import json
+from datetime import datetime
+
+DATABASE_NAME = 'database/threat_db.sqlite'
+
+def init_db():
+    """Initializes the database with an upgraded schema."""
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS pulses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source TEXT NOT NULL,
+                title TEXT NOT NULL UNIQUE,
+                url TEXT,
+                threat_name TEXT,
+                threat_category TEXT, -- NEW FIELD
+                targeted_industries TEXT,
+                targeted_countries TEXT,
+                summary TEXT,
+                published_at DATETIME,
+                collection_timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS indicators (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                type TEXT NOT NULL,
+                value TEXT NOT NULL UNIQUE,
+                enrichment_data TEXT
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS pulse_indicators (
+                pulse_id INTEGER,
+                indicator_id INTEGER,
+                FOREIGN KEY(pulse_id) REFERENCES pulses(id),
+                FOREIGN KEY(indicator_id) REFERENCES indicators(id),
+                PRIMARY KEY (pulse_id, indicator_id)
+            )
+        ''')
+        conn.commit()
+
+def insert_pulse_and_indicators(pulse_data):
+    """Inserts a pulse and its associated indicators into the upgraded schema."""
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        cursor = conn.cursor()
+        try:
+            cursor.execute('''
+                INSERT INTO pulses (source, title, url, threat_name, threat_category, targeted_industries, targeted_countries, summary, published_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                pulse_data.get('source'),
+                pulse_data.get('title'),
+                pulse_data.get('url'),
+                pulse_data.get('threat_name'),
+                pulse_data.get('threat_category'), # NEW FIELD
+                json.dumps(pulse_data.get('targeted_industries', [])),
+                json.dumps(pulse_data.get('targeted_countries', [])),
+                pulse_data.get('summary'),
+                pulse_data.get('published_at')
+            ))
+            pulse_id = cursor.lastrowid
+            
+            for ioc in pulse_data.get('indicators', []):
+                cursor.execute("INSERT OR IGNORE INTO indicators (type, value, enrichment_data) VALUES (?, ?, ?)",
+                               (ioc.get('type'), ioc.get('value'), json.dumps(ioc.get('enrichment'))))
+                cursor.execute("SELECT id FROM indicators WHERE value = ?", (ioc.get('value'),))
+                indicator_id = cursor.fetchone()[0]
+                cursor.execute("INSERT OR IGNORE INTO pulse_indicators (pulse_id, indicator_id) VALUES (?, ?)",
+                               (pulse_id, indicator_id))
+            
+            conn.commit()
+            print(f"Successfully inserted pulse: {pulse_data.get('title')}")
+            return True
+
+        except sqlite3.IntegrityError:
+            print(f"Skipping duplicate pulse: {pulse_data.get('title')}")
+            return False
+        except Exception as e:
+            conn.rollback()
+            print(f"Error inserting pulse data: {e}")
+            return False
+
+def get_pulses(limit=50):
+    """Retrieves the most recent pulses."""
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM pulses ORDER BY published_at DESC LIMIT ?", (limit,))
+        return [dict(row) for row in cursor.fetchall()]
+
+def get_pulse_details(pulse_id):
+    """Retrieves a single pulse and its linked indicators."""
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT * FROM pulses WHERE id = ?", (pulse_id,))
+        pulse_row = cursor.fetchone()
+        if not pulse_row: return None
+        pulse = dict(pulse_row)
+
+        cursor.execute('''
+            SELECT i.type, i.value, i.enrichment_data
+            FROM indicators i
+            JOIN pulse_indicators pi ON i.id = pi.indicator_id
+            WHERE pi.pulse_id = ?
+        ''', (pulse_id,))
+        
+        indicators = [dict(row) for row in cursor.fetchall()]
+        pulse['indicators'] = indicators
+        return pulse
+
+
+5 > dashboard.js : 
+
+
+document.addEventListener('DOMContentLoaded', function () {
+    const pulseListContainer = document.getElementById('pulse-list');
+    const pulseDetailContainer = document.getElementById('pulse-detail-container');
+    let activePulseId = null;
+
+    // --- Geolocation Data ---
+    const countryCoords = { "USA": [39.8, -98.6], "United States": [39.8, -98.6], "Russia": [61.5, 105.3], "China": [35.9, 104.2], "Germany": [51.2, 10.5], "UK": [55.4, -3.4], "United Kingdom": [55.4, -3.4], "Brazil": [-14.2, -51.9], "India": [20.6, 78.9], "Australia": [-25.3, 133.8], "Canada": [56.1, -106.3], "France": [46.6, 1.9], "Iran": [32.4, 53.7], "North Korea": [40.3, 127.5], "Ukraine": [48.4, 31.2], "Global": [20, 0] };
+
+    // --- Map Initialization ---
+    const map = L.map('threat-map').setView([25, 10], 2); // Set initial view
+    L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+        attribution: '&copy; <a href="https://carto.com/attributions">CARTO</a>',
+        subdomains: 'abcd',
+        maxZoom: 19
+    }).addTo(map);
+    let threatMarkers = L.layerGroup().addTo(map);
+
+    // --- Fetch and Render the list of pulses in the sidebar ---
+    async function fetchAndRenderPulseList() {
+        try {
+            const response = await fetch('/api/pulses');
+            const pulses = await response.json();
+            pulseListContainer.innerHTML = ''; 
+
+            if (pulses.length === 0) {
+                pulseListContainer.innerHTML = '<p class="loading">No pulses found.</p>';
+                return;
+            }
+
+            // Update both the sidebar and the map
+            updateSidebar(pulses);
+            updateMap(pulses);
+
+        } catch (error) {
+            console.error("Failed to fetch pulse list:", error);
+            pulseListContainer.innerHTML = '<p class="loading">Error loading data.</p>';
+        }
+    }
+
+    function updateSidebar(pulses) {
+        pulses.forEach(pulse => {
+            const pulseItem = document.createElement('div');
+            pulseItem.className = 'pulse-item';
+            pulseItem.dataset.pulseId = pulse.id;
+            pulseItem.innerHTML = `
+                <h3>${pulse.title}</h3>
+                <div class="meta">
+                    <span class="category-tag">${pulse.threat_category || 'General'}</span>
+                    <span>${new Date(pulse.published_at).toLocaleDateString()}</span>
+                </div>
+            `;
+            pulseItem.addEventListener('click', () => fetchAndRenderPulseDetail(pulse.id));
+            pulseListContainer.appendChild(pulseItem);
+        });
+    }
+
+    function updateMap(pulses) {
+        threatMarkers.clearLayers();
+        pulses.forEach(pulse => {
+            const countries = JSON.parse(pulse.targeted_countries || '[]');
+            if (countries.length === 0) countries.push("Global");
+
+            countries.forEach(countryName => {
+                const coords = countryCoords[countryName.trim()];
+                if (coords) {
+                    const marker = L.circleMarker(coords, {
+                        radius: 6, color: '#e83e8c', weight: 1.5,
+                        fillColor: '#e83e8c', fillOpacity: 0.6
+                    }).bindPopup(`<b>${pulse.title}</b>`);
+                    
+                    marker.on('mouseover', function (e) { this.openPopup(); });
+                    marker.on('mouseout', function (e) { this.closePopup(); });
+                    marker.on('click', () => fetchAndRenderPulseDetail(pulse.id));
+                    
+                    threatMarkers.addLayer(marker);
+                }
+            });
+        });
+    }
+
+    async function fetchAndRenderPulseDetail(pulseId) {
+        if (activePulseId === pulseId) return;
+
+        try {
+            const response = await fetch(`/api/pulse/${pulseId}`);
+            const pulse = await response.json();
+            
+            pulseDetailContainer.innerHTML = createPulseDetailHTML(pulse);
+            
+            if (activePulseId) {
+                document.querySelector(`.pulse-item[data-pulse-id='${activePulseId}']`)?.classList.remove('active');
+            }
+            document.querySelector(`.pulse-item[data-pulse-id='${pulseId}']`)?.classList.add('active');
+            activePulseId = pulseId;
+
+            // --- INTERACTIVE MAP UPDATE ---
+            const countries = JSON.parse(pulse.targeted_countries || '[]');
+            if (countries.length > 0) {
+                const primaryCountry = countries[0].trim();
+                const coords = countryCoords[primaryCountry];
+                if (coords) {
+                    map.flyTo(coords, 5, { animate: true, duration: 1.5 }); // Zoom to location
+                }
+            }
+
+        } catch (error) {
+            console.error("Failed to fetch pulse details:", error);
+            pulseDetailContainer.innerHTML = `<div class="placeholder"><p>Error loading pulse details.</p></div>`;
+        }
+    }
+
+    function createPulseDetailHTML(pulse) {
+        const industries = JSON.parse(pulse.targeted_industries || '[]').map(ind => `<span class="tag industry">${ind}</span>`).join(' ');
+        const countries = JSON.parse(pulse.targeted_countries || '[]').map(ctry => `<span class="tag country">${ctry}</span>`).join(' ');
+        const categoryTag = `<span class="tag category">${pulse.threat_category || 'General'}</span>`;
+
+        let indicatorsHTML = '<p>No indicators found for this pulse.</p>';
+        if (pulse.indicators && pulse.indicators.length > 0) {
+            indicatorsHTML = pulse.indicators.map(ioc => {
+                let enrichmentHTML = '';
+                const enrichmentData = JSON.parse(ioc.enrichment_data || '{}');
+                if (enrichmentData && enrichmentData.abuseConfidenceScore) {
+                    enrichmentHTML = `<span class="ioc-enrichment">AbuseIPDB Score: ${enrichmentData.abuseConfidenceScore}%</span>`;
+                }
+                return `<div class="ioc-item">
+                            <div><span class="ioc-type">${ioc.type.toUpperCase()}:</span> <span class="ioc-value">${ioc.value}</span></div>
+                            ${enrichmentHTML}
+                        </div>`;
+            }).join('');
+        }
+
+        return `
+            <div class="pulse-detail-view">
+                <h1>${pulse.title}</h1>
+                <div class="tags-container">
+                    ${categoryTag}
+                    ${countries}
+                    ${industries}
+                </div>
+                <p class="summary">${pulse.summary || 'No summary available.'}</p>
+                <h2 class="section-title">Indicators of Compromise (IoCs)</h2>
+                <div id="indicators-list">${indicatorsHTML}</div>
+                <div class="source-link">
+                    <a href="${pulse.url}" target="_blank">Read Full Report at ${pulse.source}</a>
+                </div>
+            </div>`;
+    }
+
+    // --- Initial Load ---
+    fetchAndRenderPulseList();
+});
