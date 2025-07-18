@@ -105,88 +105,82 @@ def scrape_url_to_raw_data(url):
         return None
 
 
-#commented start 
 
+class DiscoveryAgent:
+    def __init__(self):
+        self.api_key = os.getenv("SERPER_API_KEY")
+        self.conn = http.client.HTTPSConnection("google.serper.dev")
+        self.domain_blacklist = { 'twitter.com', 'linkedin.com', 'facebook.com', 'youtube.com', 'github.com', 'google.com', 'microsoft.com', 'apple.com', 't.co', 'cisa.gov', 'nist.gov', 'alienvault.com', 'bleepingcomputer.com', 'thehackernews.com' }
 
+    def _get_top_threat_names(self, limit=5):
+        """Gets the most frequently mentioned threat names from our database to search for."""
+        with sqlite3.connect(DATABASE_NAME) as conn:
+            cursor = conn.cursor()
+            try:
+                cursor.execute("""
+                    SELECT threat_name, COUNT(*) as count 
+                    FROM pulses 
+                    WHERE threat_name IS NOT 'N/A' AND threat_name IS NOT ''
+                    GROUP BY threat_name 
+                    HAVING count > 1
+                    ORDER BY count DESC 
+                    LIMIT ?
+                """, (limit,))
+                return [row[0] for row in cursor.fetchall()]
+            except sqlite3.OperationalError:
+                # This can happen if the table doesn't exist on the very first run
+                return []
 
-# class DiscoveryAgent:
-#     def __init__(self):
-#         self.api_key = os.getenv("SERPER_API_KEY")
-#         self.conn = http.client.HTTPSConnection("google.serper.dev")
-#         self.domain_blacklist = { 'twitter.com', 'linkedin.com', 'facebook.com', 'youtube.com', 'github.com', 'google.com', 'microsoft.com', 'apple.com', 't.co', 'cisa.gov', 'nist.gov', 'alienvault.com', 'bleepingcomputer.com', 'thehackernews.com' }
-
-#     def _get_top_threat_names(self, limit=5):
-#         """Gets the most frequently mentioned threat names from our database to search for."""
-#         with sqlite3.connect(DATABASE_NAME) as conn:
-#             cursor = conn.cursor()
-#             try:
-#                 cursor.execute("""
-#                     SELECT threat_name, COUNT(*) as count 
-#                     FROM pulses 
-#                     WHERE threat_name IS NOT 'N/A' AND threat_name IS NOT ''
-#                     GROUP BY threat_name 
-#                     HAVING count > 1
-#                     ORDER BY count DESC 
-#                     LIMIT ?
-#                 """, (limit,))
-#                 return [row[0] for row in cursor.fetchall()]
-#             except sqlite3.OperationalError:
-#                 # This can happen if the table doesn't exist on the very first run
-#                 return []
-
-#     def search_for_sources(self, threat_name):
-#         """Uses Serper API to find new potential sources for a given threat."""
-#         if not self.api_key: return []
+    def search_for_sources(self, threat_name):
+        """Uses Serper API to find new potential sources for a given threat."""
+        if not self.api_key: return []
         
-#         print(f"  AGENT (Discovery): Searching Serper for new sources related to '{threat_name}'...")
-#         query = f'"{threat_name}" security research OR "vulnerability analysis"'
+        print(f"  AGENT (Discovery): Searching Serper for new sources related to '{threat_name}'...")
+        query = f'"{threat_name}" security research OR "vulnerability analysis"'
         
-#         try:
-#             payload = json.dumps({"q": query})
-#             headers = {'X-API-KEY': self.api_key, 'Content-Type': 'application/json'}
-#             self.conn.request("POST", "/search", payload, headers)
-#             res = self.conn.getresponse()
-#             data = res.read()
-#             search_results = json.loads(data.decode("utf-8"))
-#             return [result['link'] for result in search_results.get('organic', [])]
-#         except Exception as e:
-#             print(f"    ERROR during Serper API call: {e}")
-#             return []
+        try:
+            payload = json.dumps({"q": query})
+            headers = {'X-API-KEY': self.api_key, 'Content-Type': 'application/json'}
+            self.conn.request("POST", "/search", payload, headers)
+            res = self.conn.getresponse()
+            data = res.read()
+            search_results = json.loads(data.decode("utf-8"))
+            return [result['link'] for result in search_results.get('organic', [])]
+        except Exception as e:
+            print(f"    ERROR during Serper API call: {e}")
+            return []
 
-#     def run_discovery_cycle(self):
-#         """The main orchestrator for the discovery process."""
-#         if not self.api_key:
-#             print("AGENT (Discovery): SERPER_API_KEY not found in .env. Skipping discovery cycle.")
-#             return
+    def run_discovery_cycle(self):
+        """The main orchestrator for the discovery process."""
+        if not self.api_key:
+            print("AGENT (Discovery): SERPER_API_KEY not found in .env. Skipping discovery cycle.")
+            return
 
-#         threats_to_search = self._get_top_threat_names()
-#         if not threats_to_search:
-#             print("AGENT (Discovery): Not enough existing threat data to search for new sources yet.")
-#             return
+        threats_to_search = self._get_top_threat_names()
+        if not threats_to_search:
+            print("AGENT (Discovery): Not enough existing threat data to search for new sources yet.")
+            return
 
-#         all_new_domains = set()
-#         for threat in threats_to_search:
-#             links = self.search_for_sources(threat)
-#             for link in links:
-#                 try:
-#                     ext = tldextract.extract(link)
-#                     domain = f"{ext.domain}.{ext.suffix}"
-#                     if domain and domain not in self.domain_blacklist:
-#                         all_new_domains.add(domain)
-#                 except Exception: continue
+        all_new_domains = set()
+        for threat in threats_to_search:
+            links = self.search_for_sources(threat)
+            for link in links:
+                try:
+                    ext = tldextract.extract(link)
+                    domain = f"{ext.domain}.{ext.suffix}"
+                    if domain and domain not in self.domain_blacklist:
+                        all_new_domains.add(domain)
+                except Exception: continue
         
-#         print(f"AGENT (Discovery): Found {len(all_new_domains)} unique new domains to vet.")
-#         with sqlite3.connect(DATABASE_NAME) as conn:
-#             cursor = conn.cursor()
-#             for domain in all_new_domains:
-#                 cursor.execute("SELECT domain FROM dynamic_sources WHERE domain = ?", (domain,))
-#                 if cursor.fetchone(): continue
-#                 if vet_domain_with_ai(domain):
-#                     add_dynamic_source(domain)
-#                     print(f"  AGENT (Discovery): NEW SOURCE ADDED -> {domain}")
-
-#comment end 
-
+        print(f"AGENT (Discovery): Found {len(all_new_domains)} unique new domains to vet.")
+        with sqlite3.connect(DATABASE_NAME) as conn:
+            cursor = conn.cursor()
+            for domain in all_new_domains:
+                cursor.execute("SELECT domain FROM dynamic_sources WHERE domain = ?", (domain,))
+                if cursor.fetchone(): continue
+                if vet_domain_with_ai(domain):
+                    add_dynamic_source(domain)
+                    print(f"  AGENT (Discovery): NEW SOURCE ADDED -> {domain}")
 
 class SocialMediaAgent:
     def __init__(self):
