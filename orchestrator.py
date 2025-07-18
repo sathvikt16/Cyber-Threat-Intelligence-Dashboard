@@ -1,6 +1,6 @@
 import schedule
 import time
-from agents import DataIngestionAgent, IntelligenceExtractionAgent, IoCAnalysisAgent, PersistenceAgent, DiscoveryAgent # <-- Add DiscoveryAgent
+from agents import DataIngestionAgent, IntelligenceExtractionAgent, IoCAnalysisAgent, PersistenceAgent
 from database.db_handler import init_db
 from processor.vertex_ai_processor import check_ai_health
 
@@ -20,22 +20,16 @@ def main_workflow():
     # --- Step 1: Process Unstructured Data (Needs AI) ---
     print("\n--- Processing Unstructured Sources (CISA, NIST, News) ---")
     raw_cisa = ingestion_agent.ingest_cisa()
-    
-    # Increased limit for The Hacker News to get more data
     raw_thn = ingestion_agent.ingest_hacker_news(limit=10)
-    
     raw_nist = ingestion_agent.ingest_nist_nvd(days=2)
     unstructured_raw_data = raw_cisa + raw_thn + raw_nist
     
     print(f"\nORCHESTRATOR: Ingested {len(unstructured_raw_data)} unstructured items for AI processing.")
 
     for raw_item in unstructured_raw_data:
-        # Pass through the AI processing pipeline
         pulse = extraction_agent.process_raw_data(raw_item)
         if pulse:
-            # Enrich indicators if any are found
             pulse['indicators'] = analysis_agent.enrich_indicators(pulse.get('indicators', []))
-            # Save the final, processed pulse to the database
             persistence_agent.save_pulse(pulse)
             print("-" * 20)
 
@@ -45,40 +39,29 @@ def main_workflow():
     print(f"\nORCHESTRATOR: Ingested {len(otx_pulses)} pre-structured OTX pulses.")
     
     for pulse in otx_pulses:
-        # Data is already structured, so we just enrich and save
         pulse['indicators'] = analysis_agent.enrich_indicators(pulse.get('indicators', []))
         persistence_agent.save_pulse(pulse)
         print("-" * 20)
 
     print("\nORCHESTRATOR: Workflow run finished.")
 
-# --- NEW: A separate job function for the discovery agent ---
-def discovery_workflow():
-    """A dedicated workflow for discovering new sources."""
-    print("\n" + "="*50 + f"\nORCHESTRATOR: Starting Discovery Workflow at {time.ctime()}\n" + "="*50)
-    discovery_agent = DiscoveryAgent()
-    discovery_agent.run_discovery_cycle()
-    print("\nORCHESTRATOR: Discovery Workflow finished.")
-
 def main():
+    """
+    Main function to initialize and run the CTI orchestrator.
+    """
     print("Initializing CTI Orchestrator...")
+    
     if not check_ai_health():
         print("Aborting startup due to AI health check failure.")
         return
+
     init_db()
     
-    # Run the main data collection workflow once immediately
     main_workflow()
     
-    # Schedule the main workflow to run every 2 hours
     schedule.every(2).hours.do(main_workflow)
     
-    # --- NEW: Schedule the discovery workflow to run once a day ---
-    schedule.every().day.at("03:00").do(discovery_workflow) # Run at 3 AM
-    
-    print("\nOrchestrator started. Data collection and discovery jobs are scheduled.")
-    print("Running initial discovery pass now...")
-    discovery_workflow() # Also run discovery once on startup
+    print("\nOrchestrator started. Next run is scheduled in 2 hours.")
     
     while True:
         schedule.run_pending()
