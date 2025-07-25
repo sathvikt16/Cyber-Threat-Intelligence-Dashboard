@@ -4,7 +4,7 @@ This project is an AI-powered, autonomous Cyber Threat Intelligence (CTI) platfo
 
 The system continuously ingests data from a variety of high-quality public sources, uses a sophisticated AI agent pipeline to analyze and structure the information, and presents it in a professional, three-pane analytical dashboard for immediate situational awareness and decision support.
 
-<img width="1656" alt="image" src="https://panwgithub.paloaltonetworks.local/sat/Cyber-Threat-Intelligence-Dashboard/assets/3256/b750a1de-cce8-4ca2-bf30-7c268c7b6202">
+<img width="3312" height="1756" alt="image" src="https://github.com/user-attachments/assets/212adeb1-1be5-40f0-9d9e-b071c53e3562" />
 
 
 ---
